@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Talamh – Tag GPS to Latest Sample</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+  .card { max-width: 680px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 12px; }
+  h1 { font-size: 1.2rem; margin: 0 0 8px; }
+  button { padding: 12px 16px; border-radius: 10px; border: 0; background: #0b8; color: #fff; font-weight: 600; }
+  button[disabled] { opacity: 0.6; }
+  .row { margin: 10px 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all;}
+  .small { color:#555; font-size: .9rem; }
+  .ok { color: #0a7; }
+  .err { color: #c33; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Talamh – Tag GPS to Latest Sample</h1>
+
+  <div class="row small">Firebase DB:</div>
+  <div class="row mono" id="db"></div>
+
+  <div class="row small">Latest sample detected:</div>
+  <div class="row mono" id="latest">Loading…</div>
+
+  <div class="row">
+    <button id="btn" disabled>Tag GPS to Latest Sample</button>
+  </div>
+
+  <div class="row small">Status:</div>
+  <div class="row mono" id="status">Waiting…</div>
+
+  <div class="row small">Advanced</div>
+  <div class="row">
+    Override sample number: 
+    <input id="override" type="number" min="1" style="width:100px; padding:8px; border-radius:8px; border:1px solid #ccc;" />
+    <button id="setOverride" style="margin-left:8px; background:#08b; border:0; color:#fff; padding:8px 10px; border-radius:8px;">Use</button>
+  </div>
+</div>
+
+<script>
+/* ======= CONFIG — EDIT THESE TWO LINES ======= */
+const DB = "https://field-testing-11766-default-rtdb.firebaseio.com"; // your Firebase RTDB URL (https)
+const ACCURACY_OPTS = { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 };
+/* ============================================ */
+
+const $db = document.getElementById('db');
+const $latest = document.getElementById('latest');
+const $status = document.getElementById('status');
+const $btn = document.getElementById('btn');
+const $override = document.getElementById('override');
+const $setOverride = document.getElementById('setOverride');
+
+let latestSampleNum = null;
+
+function setStatus(msg, ok=false, err=false){
+  $status.textContent = msg;
+  $status.className = "row mono " + (ok ? "ok" : err ? "err" : "");
+}
+
+async function getLatestSample() {
+  // Get just the keys under /samples (shallow= true returns { "Sample_1": true, ... })
+  const r = await fetch(`${DB}/samples.json?shallow=true`);
+  if (!r.ok) throw new Error("Failed to list samples");
+  const obj = await r.json() || {};
+  const keys = Object.keys(obj);
+  if (!keys.length) return null;
+  const nums = keys
+    .filter(k => /^Sample_\d+$/.test(k))
+    .map(k => parseInt(k.split("_")[1], 10))
+    .filter(n => Number.isFinite(n));
+  if (!nums.length) return null;
+  return Math.max(...nums);
+}
+
+function phoneTimestampFields(){
+  const now = new Date();
+  return {
+    phone_ts_unix_ms: Date.now(),
+    phone_ts_iso: now.toISOString(),
+    phone_tz_offset_min: -now.getTimezoneOffset() // e.g., +60 for IST (summer)
+  };
+}
+
+async function patchJSON(path, data){
+  const r = await fetch(`${DB}${path}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`PATCH ${path} failed: ${r.status} ${txt}`);
+  }
+  return r.json();
+}
+
+async function postJSON(path, data){
+  const r = await fetch(`${DB}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`POST ${path} failed: ${r.status} ${txt}`);
+  }
+  return r.json();
+}
+
+async function refreshLatest() {
+  try {
+    setStatus("Checking latest sample…");
+    const n = await getLatestSample();
+    latestSampleNum = n;
+    if (!n) {
+      $latest.textContent = "No samples found.";
+      $btn.disabled = true;
+      setStatus("No samples yet. Take a sample with the device, then come back here.");
+      return;
+    }
+    $latest.textContent = `Sample_${n}`;
+    $btn.disabled = false;
+    setStatus("Ready.");
+  } catch (e) {
+    $latest.textContent = "Error fetching samples.";
+    $btn.disabled = true;
+    setStatus(e.message, false, true);
+  }
+}
+
+async function tagGPS(){
+  try {
+    if (!latestSampleNum) throw new Error("No latest sample.");
+    setStatus("Requesting phone location…");
+    if (!("geolocation" in navigator)) throw new Error("Geolocation not supported on this device/browser.");
+    navigator.geolocation.getCurrentPosition(async pos => {
+      try {
+        setStatus("Got location. Writing to Firebase…");
+        const p = pos.coords;
+
+        // Build the payload with both server and phone timestamps
+        const timeFields = phoneTimestampFields();
+        const base = {
+          ts: { ".sv": "timestamp" },      // server time, ms since epoch
+          ...timeFields,
+          lat: p.latitude,
+          lon: p.longitude,
+          accuracy_m: p.accuracy
+        };
+        if (Number.isFinite(p.altitude)) base.alt_m = p.altitude;
+        if (Number.isFinite(p.speed)) base.speed_mps = p.speed;
+        if (Number.isFinite(p.heading)) base.heading_deg = p.heading;
+
+        const samplePath = `/samples/Sample_${latestSampleNum}`;
+        // 1) Write single "meta" record (overwrites)
+        await patchJSON(`${samplePath}/meta.json`, base);
+
+        // 2) Append to gps_logs (history)
+        await postJSON(`${samplePath}/gps_logs.json`, base);
+
+        setStatus("GPS tagged to latest sample ✅", true, false);
+      } catch (err) {
+        setStatus(err.message, false, true);
+      }
+    }, err => {
+      setStatus(`GPS error: ${err.message}`, false, true);
+    }, ACCURACY_OPTS);
+  } catch (e) {
+    setStatus(e.message, false, true);
+  }
+}
+
+$setOverride.onclick = () => {
+  const v = parseInt($override.value, 10);
+  if (Number.isFinite(v) && v > 0) {
+    latestSampleNum = v;
+    $latest.textContent = `Sample_${v} (override)`;
+    $btn.disabled = false;
+    setStatus("Override set. Ready.");
+  } else {
+    setStatus("Invalid override number.", false, true);
+  }
+};
+
+$btn.onclick = tagGPS;
+$db.textContent = DB;
+refreshLatest();
+</script>
+</body>
+</html>
